@@ -2,6 +2,8 @@ package ebpf
 
 import (
 	"math"
+	"reflect"
+	"strings"
 
 	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/internal"
@@ -123,6 +125,63 @@ func (cs *CollectionSpec) RewriteConstants(consts map[string]interface{}) error 
 
 	rodata.Contents[0] = MapKV{kv.Key, buf}
 	return nil
+}
+
+// Assign the contents of a collection spec to a struct.
+//
+// This function is a short-cut to manually checking the presence
+// of maps and programs in a collection spec.
+//
+// The argument to must be a pointer to a struct. A field of the
+// struct is updated with values from Programs or Maps if it
+// has an `ebpf` tag and its type is *ProgramSpec or *MapSpec.
+// The tag gives the name of the program or map as found in
+// the CollectionSpec.
+//
+//    struct {
+//        Foo     *ebpf.ProgramSpec `ebpf:"xdp_foo"`
+//        Bar     *ebpf.MapSpec     `ebpf:"bar_map"`
+//        Ignored int
+//    }
+//
+// Returns an error if any of the fields can't be found, or
+// if the same map or program is assigned multiple times.
+func (cs *CollectionSpec) Assign(to interface{}) error {
+	kinds := map[reflect.Type]assignFunc{
+		reflect.TypeOf((*ProgramSpec)(nil)): func(name string) (reflect.Value, error) {
+			p := cs.Programs[name]
+			if p == nil {
+				return reflect.Value{}, xerrors.Errorf("missing program %q", name)
+			}
+			return reflect.ValueOf(p), nil
+		},
+		reflect.TypeOf((*MapSpec)(nil)): func(name string) (reflect.Value, error) {
+			m := cs.Maps[name]
+			if m == nil {
+				return reflect.Value{}, xerrors.Errorf("missing map %q", name)
+			}
+			return reflect.ValueOf(m), nil
+		},
+	}
+
+	return assignValues(to, kinds)
+}
+
+// AssignCollection creates a collection from a spec, and assigns it to a struct.
+//
+// See Collection.Assign for details.
+func (cs *CollectionSpec) AssignCollection(to interface{}, opts *CollectionOptions) error {
+	if opts == nil {
+		opts = &CollectionOptions{}
+	}
+
+	coll, err := NewCollectionWithOptions(cs, *opts)
+	if err != nil {
+		return err
+	}
+	defer coll.Close()
+
+	return coll.Assign(to)
 }
 
 // Collection is a collection of Programs and Maps associated
@@ -290,4 +349,106 @@ func (coll *Collection) DetachProgram(name string) *Program {
 	p := coll.Programs[name]
 	delete(coll.Programs, name)
 	return p
+}
+
+// Assign the contents of a collection to a struct.
+//
+// `to` must be a pointer to a struct like the following:
+//
+//    struct {
+//        Foo     *ebpf.Program `ebpf:"xdp_foo"`
+//        Bar     *ebpf.Map     `ebpf:"bar_map"`
+//        Ignored int
+//    }
+//
+// See CollectionSpec.Assign for the semantics of this function.
+//
+// DetachMap and DetachProgram is invoked for all assigned elements
+// if the function is successful.
+func (coll *Collection) Assign(to interface{}) error {
+	assignedMaps := make(map[string]struct{})
+	assignedPrograms := make(map[string]struct{})
+	kinds := map[reflect.Type]assignFunc{
+		reflect.TypeOf((*Program)(nil)): func(name string) (reflect.Value, error) {
+			p := coll.Programs[name]
+			if p == nil {
+				return reflect.Value{}, xerrors.Errorf("missing program %q", name)
+			}
+			assignedPrograms[name] = struct{}{}
+			return reflect.ValueOf(p), nil
+		},
+		reflect.TypeOf((*Map)(nil)): func(name string) (reflect.Value, error) {
+			m := coll.Maps[name]
+			if m == nil {
+				return reflect.Value{}, xerrors.Errorf("missing map %q", name)
+			}
+			assignedMaps[name] = struct{}{}
+			return reflect.ValueOf(m), nil
+		},
+	}
+
+	if err := assignValues(to, kinds); err != nil {
+		return err
+	}
+
+	for name := range assignedPrograms {
+		coll.DetachProgram(name)
+	}
+
+	for name := range assignedMaps {
+		coll.DetachMap(name)
+	}
+
+	return nil
+}
+
+type assignFunc func(string) (reflect.Value, error)
+
+func assignValues(to interface{}, kinds map[reflect.Type]assignFunc) error {
+	v := reflect.ValueOf(to)
+	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+		return xerrors.Errorf("%T is not a pointer to a struct", to)
+	}
+
+	type elem struct {
+		typ  reflect.Type
+		name string
+	}
+
+	var (
+		s          = v.Elem()
+		sT         = s.Type()
+		assignedTo = make(map[elem]string)
+	)
+	for i := 0; i < sT.NumField(); i++ {
+		field := sT.Field(i)
+
+		name := field.Tag.Get("ebpf")
+		if name == "" {
+			continue
+		}
+		if strings.Contains(name, ",") {
+			return xerrors.Errorf("field %s: ebpf tag contains a comma", field.Name)
+		}
+
+		fn := kinds[field.Type]
+		if fn == nil {
+			return xerrors.Errorf("field %s has unsupported type %s", field.Name, field.Type)
+		}
+
+		e := elem{field.Type, name}
+		if assignedField := assignedTo[e]; assignedField != "" {
+			return xerrors.Errorf("field %s: %q was already assigned to %s", field.Name, name, assignedField)
+		}
+
+		value, err := fn(name)
+		if err != nil {
+			return xerrors.Errorf("field %s: %w", field.Name, err)
+		}
+
+		s.Field(i).Set(value)
+		assignedTo[e] = field.Name
+	}
+
+	return nil
 }

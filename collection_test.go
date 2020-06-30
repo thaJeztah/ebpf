@@ -153,3 +153,98 @@ func TestCollectionSpecRewriteMaps(t *testing.T) {
 		t.Fatal("new / override map not used")
 	}
 }
+
+func TestCollectionAssign(t *testing.T) {
+	var specs struct {
+		Program *ProgramSpec `ebpf:"prog1"`
+		Map     *MapSpec     `ebpf:"map1"`
+	}
+
+	mapSpec := &MapSpec{
+		Type:       Array,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 1,
+	}
+	progSpec := &ProgramSpec{
+		Type: SocketFilter,
+		Instructions: asm.Instructions{
+			asm.LoadImm(asm.R1, 0, asm.DWord),
+			asm.LoadImm(asm.R0, 0, asm.DWord),
+			asm.Return(),
+		},
+		License: "MIT",
+	}
+
+	cs := &CollectionSpec{
+		Maps: map[string]*MapSpec{
+			"map1": mapSpec,
+		},
+		Programs: map[string]*ProgramSpec{
+			"prog1": progSpec,
+		},
+	}
+
+	if err := cs.Assign(&specs); err != nil {
+		t.Fatal("Can't assign spec:", err)
+	}
+
+	if specs.Program != progSpec {
+		t.Fatalf("Expected Program to be %p, got %p", progSpec, specs.Program)
+	}
+
+	if specs.Map != mapSpec {
+		t.Fatalf("Expected Map to be %p, got %p", mapSpec, specs.Map)
+	}
+
+	if err := cs.Assign(new(int)); err == nil {
+		t.Fatal("Assign allows to besides *struct")
+	}
+
+	if err := cs.Assign(new(struct{ Foo int })); err != nil {
+		t.Fatal("Assign doesn't ignore untagged fields")
+	}
+
+	coll, err := NewCollection(cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer coll.Close()
+
+	invalid := new(struct {
+		P       *Program `ebpf:"prog1"`
+		M       *Map     `ebpf:"map1"`
+		Invalid int
+	})
+
+	if err := cs.Assign(invalid); err == nil {
+		t.Fatal("Expect Assign to fail")
+	}
+
+	if coll.Programs["prog1"] == nil {
+		t.Fatal("Assign detaches Program on error")
+	}
+
+	if coll.Maps["map1"] == nil {
+		t.Fatal("Assign detaches Map on error")
+	}
+
+	var objs struct {
+		Program *Program `ebpf:"prog1"`
+		Map     *Map     `ebpf:"map1"`
+	}
+
+	if err := coll.Assign(&objs); err != nil {
+		t.Fatal("Can't Assign objects:", err)
+	}
+	objs.Program.Close()
+	objs.Map.Close()
+
+	if coll.Programs["prog1"] != nil {
+		t.Fatal("Assign doesn't detach Program")
+	}
+
+	if coll.Maps["map1"] != nil {
+		t.Fatal("Assign doesn't detach Map")
+	}
+}
