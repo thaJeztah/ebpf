@@ -8,8 +8,8 @@ import (
 	"io/ioutil"
 	"os"
 	"strconv"
+	"strings"
 	"time"
-      "strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
@@ -24,14 +24,14 @@ func getTracepointID() (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to read tracepoint ID for 'sys_enter_open': %v", err)
 	}
-      tid := strings.TrimSuffix(string(data), "\n")
-      return strconv.ParseUint(tid, 10, 64)
+	tid := strings.TrimSuffix(string(data), "\n")
+	return strconv.ParseUint(tid, 10, 64)
 }
 
-// Example_program demonstrates how to attach an eBPF program to a tracepoint.
+// This demonstrates how to attach an eBPF program to a tracepoint.
 // The program will be attached to the sys_enter_open syscall and print out the integer
 // 123 everytime the sycall is used.
-func Example_program() {
+func Example_tracepoint() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	events, err := ebpf.NewMap(&ebpf.MapSpec{
